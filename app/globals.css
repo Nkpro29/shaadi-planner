@@ -1,0 +1,42 @@
+@import "tailwindcss";
+
+@theme {
+  --color-ivory: #f4efe6;
+  --color-cream: #fbf7f1;
+  --color-paper: #fffdfb;
+  --color-maroon: #6e1e2c;
+  --color-maroon-deep: #4a1520;
+  --color-gold: #9a7b3c;
+  --color-gold-soft: #e7d7b1;
+  --color-ink: #2c261f;
+  --color-muted: #6e655c;
+  --color-line: #e6dccb;
+  --color-ok: #246b45;
+  --color-danger: #8f332c;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  min-height: 100vh;
+  background: var(--color-ivory);
+  color: var(--color-ink);
+  font-family: var(--font-nunito), "Nunito Sans", sans-serif;
+}
+
+.font-display {
+  font-family: var(--font-cormorant), Georgia, serif;
+  font-weight: 600;
+}
+
+::selection {
+  background: #e7d7b1;
+}
+
+input,
+select,
+textarea {
+  font: inherit;
+}
