@@ -1,7 +1,8 @@
 import { randomUUID } from "crypto";
-import { mkdir, readFile, rename, writeFile } from "fs/promises";
+import { readFile } from "fs/promises";
 import path from "path";
 import { OWNER_EMAIL, type ManagedUser, type UserRole } from "./constants";
+import { getSql, resetSql, type Sql } from "./db";
 import { OWNER_ID, OWNER_NAME, OWNER_PASSWORD_HASH } from "./owner-seed";
 import { hashPassword, passwordError, verifyPassword } from "./password";
 
@@ -10,19 +11,8 @@ interface StoredUser {
   email: string;
   name: string;
   role: UserRole;
-  passwordHash: string;
-  createdAt: string;
-}
-
-interface StoredSession {
-  id: string;
-  userId: string;
-  expiresAt: string;
-}
-
-interface AuthFile {
-  users: StoredUser[];
-  sessions: StoredSession[];
+  password_hash: string;
+  created_at: string | Date;
 }
 
 export class AuthError extends Error {
@@ -34,30 +24,10 @@ export class AuthError extends Error {
   }
 }
 
-const FILE = path.join(process.cwd(), "data", "auth.json");
+const LOCAL_FILE = path.join(process.cwd(), "data", "auth.json");
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-let chain: Promise<void> = Promise.resolve();
-
-function withLock<T>(task: () => Promise<T>) {
-  const result = chain.then(task, task);
-  chain = result.then(
-    () => undefined,
-    () => undefined,
-  );
-  return result;
-}
-
-function ownerRecord(now = new Date().toISOString()): StoredUser {
-  return {
-    id: OWNER_ID,
-    email: OWNER_EMAIL,
-    name: OWNER_NAME,
-    role: "owner",
-    passwordHash: OWNER_PASSWORD_HASH,
-    createdAt: now,
-  };
-}
+let ready: Promise<void> | null = null;
 
 function toManaged(user: StoredUser): ManagedUser {
   return {
@@ -65,106 +35,213 @@ function toManaged(user: StoredUser): ManagedUser {
     email: user.email,
     name: user.name,
     role: user.role,
-    createdAt: user.createdAt,
+    createdAt: new Date(user.created_at).toISOString(),
   };
+}
+
+function isUniqueViolation(error: unknown) {
+  return typeof error === "object" && error !== null && "code" in error && (error as { code?: string }).code === "23505";
+}
+
+function isConnectionError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const code = "code" in error ? String((error as { code?: unknown }).code) : "";
+  if (
+    code === "CONNECTION_CLOSED" ||
+    code === "CONNECTION_ENDED" ||
+    code === "ECONNRESET" ||
+    code === "EPIPE" ||
+    code === "CONNECT_TIMEOUT"
+  ) {
+    return true;
+  }
+  return "cause" in error && isConnectionError((error as { cause?: unknown }).cause);
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number) {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      const error = new Error("The database connection timed out.");
+      (error as Error & { code: string }).code = "CONNECT_TIMEOUT";
+      reject(error);
+    }, ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+function database() {
+  const sql = getSql();
+  if (!sql) throw new AuthError("Sign-in is not configured yet.", 500);
+  if (!ready) {
+    ready = ensure(sql).catch((error) => {
+      ready = null;
+      throw error;
+    });
+  }
+  return { sql, pending: ready };
+}
+
+async function withDb<T>(task: (sql: Sql) => Promise<T>, attempt = 0): Promise<T> {
+  const { sql, pending } = database();
+  try {
+    await withTimeout(pending, 12000);
+    return await withTimeout(task(sql), 12000);
+  } catch (error) {
+    if (error instanceof AuthError) throw error;
+    if (attempt < 1 && isConnectionError(error)) {
+      ready = null;
+      await resetSql();
+      return withDb(task, attempt + 1);
+    }
+    console.error(error);
+    throw new AuthError("Sign-in storage is unavailable.", 500);
+  }
+}
+
+async function ensure(sql: Sql) {
+  const existing = await sql<{ users: string | null; sessions: string | null }[]>`
+    select to_regclass('public.app_users') as users, to_regclass('public.app_sessions') as sessions
+  `;
+  if (!existing[0]?.users || !existing[0]?.sessions) {
+    await sql`
+      create table if not exists public.app_users (
+        id uuid primary key,
+        email text not null unique,
+        name text not null,
+        role text not null check (role in ('owner', 'member')),
+        password_hash text not null,
+        created_at timestamptz not null default now()
+      )
+    `;
+    await sql`
+      create table if not exists public.app_sessions (
+        id uuid primary key,
+        user_id uuid not null references public.app_users (id) on delete cascade,
+        expires_at timestamptz not null
+      )
+    `;
+    await sql`create index if not exists app_sessions_user_id_idx on public.app_sessions (user_id)`;
+    await sql`alter table public.app_users enable row level security`;
+    await sql`alter table public.app_sessions enable row level security`;
+    await sql`revoke all on table public.app_users from anon, authenticated`;
+    await sql`revoke all on table public.app_sessions from anon, authenticated`;
+  }
+  await sql`
+    insert into public.app_users (id, email, name, role, password_hash)
+    values (${OWNER_ID}::uuid, ${OWNER_EMAIL}, ${OWNER_NAME}, 'owner', ${OWNER_PASSWORD_HASH})
+    on conflict (email) do nothing
+  `;
+  await importLocalUsers(sql);
+}
+
+async function importLocalUsers(sql: Sql) {
+  let raw: string;
+  try {
+    raw = await readFile(LOCAL_FILE, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+
+  const parsed = JSON.parse(raw) as {
+    users?: Array<{ id?: string; email?: string; name?: string; role?: string; passwordHash?: string; createdAt?: string }>;
+  };
+  for (const user of parsed.users ?? []) {
+    if (!user.id || !user.email || !user.name || !user.passwordHash) continue;
+    if (user.role !== "owner" && user.role !== "member") continue;
+    try {
+      await sql`
+        insert into public.app_users (id, email, name, role, password_hash, created_at)
+        values (
+          ${user.id}::uuid,
+          ${normalizeEmail(user.email)},
+          ${user.name},
+          ${user.role},
+          ${user.passwordHash},
+          ${user.createdAt ?? new Date().toISOString()}
+        )
+        on conflict (email) do nothing
+      `;
+    } catch (error) {
+      if (!isUniqueViolation(error)) throw error;
+    }
+  }
 }
 
 export function normalizeEmail(email: string) {
   return email.trim().toLowerCase();
 }
 
-async function persist(data: AuthFile) {
-  await mkdir(path.dirname(FILE), { recursive: true });
-  const tmp = `${FILE}.${process.pid}.tmp`;
-  await writeFile(tmp, JSON.stringify(data, null, 2));
-  await rename(tmp, FILE);
-}
-
-async function load(): Promise<AuthFile> {
-  let data: AuthFile;
-  try {
-    data = JSON.parse(await readFile(FILE, "utf8")) as AuthFile;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    data = { users: [ownerRecord()], sessions: [] };
-    await persist(data);
-    return data;
-  }
-
-  if (!data || !Array.isArray(data.users) || !Array.isArray(data.sessions)) {
-    throw new AuthError("The sign-in records could not be read.", 500);
-  }
-
-  let changed = false;
-  if (!data.users.some((user) => user.role === "owner" && user.email === OWNER_EMAIL)) {
-    data.users.unshift(ownerRecord());
-    changed = true;
-  }
-
-  const now = Date.now();
-  const sessions = data.sessions.filter((session) => Date.parse(session.expiresAt) > now);
-  if (sessions.length !== data.sessions.length) {
-    data.sessions = sessions;
-    changed = true;
-  }
-
-  if (changed) await persist(data);
-  return data;
-}
-
 export function authenticate(email: string, password: string) {
-  return withLock(async () => {
-    const data = await load();
-    const user = data.users.find((item) => item.email === normalizeEmail(email));
-    const hash = user?.passwordHash ?? OWNER_PASSWORD_HASH;
-    const matches = verifyPassword(password, hash);
-    if (!user || !matches) return null;
+  return withDb(async (sql) => {
+    const rows = await sql<StoredUser[]>`
+      select id, email, name, role, password_hash, created_at
+      from public.app_users
+      where email = ${normalizeEmail(email)}
+      limit 1
+    `;
+    const user = rows[0];
+    const hash = user?.password_hash ?? OWNER_PASSWORD_HASH;
+    if (!user || !verifyPassword(password, hash)) return null;
     return toManaged(user);
   });
 }
 
 export function createSession(userId: string, expiresAt: Date) {
-  return withLock(async () => {
-    const data = await load();
+  return withDb(async (sql) => {
     const id = randomUUID();
-    data.sessions.push({ id, userId, expiresAt: expiresAt.toISOString() });
-    await persist(data);
+    await sql`
+      insert into public.app_sessions (id, user_id, expires_at)
+      values (${id}::uuid, ${userId}::uuid, ${expiresAt.toISOString()})
+    `;
+    await sql`delete from public.app_sessions where expires_at <= now()`;
     return id;
   });
 }
 
 export function userForSession(sessionId: string, userId: string) {
-  return withLock(async () => {
-    const data = await load();
-    const session = data.sessions.find((item) => item.id === sessionId && item.userId === userId);
-    if (!session || Date.parse(session.expiresAt) <= Date.now()) return null;
-    const user = data.users.find((item) => item.id === userId);
-    return user ? toManaged(user) : null;
+  return withDb(async (sql) => {
+    const rows = await sql<StoredUser[]>`
+      select u.id, u.email, u.name, u.role, u.password_hash, u.created_at
+      from public.app_sessions s
+      join public.app_users u on u.id = s.user_id
+      where s.id = ${sessionId}::uuid
+        and s.user_id = ${userId}::uuid
+        and s.expires_at > now()
+      limit 1
+    `;
+    return rows[0] ? toManaged(rows[0]) : null;
   });
 }
 
 export function revokeSession(sessionId: string) {
-  return withLock(async () => {
-    const data = await load();
-    data.sessions = data.sessions.filter((session) => session.id !== sessionId);
-    await persist(data);
+  return withDb(async (sql) => {
+    await sql`delete from public.app_sessions where id = ${sessionId}::uuid`;
   });
 }
 
 export function listUsers() {
-  return withLock(async () => {
-    const data = await load();
-    return data.users
-      .map(toManaged)
-      .sort((left, right) => {
-        if (left.role !== right.role) return left.role === "owner" ? -1 : 1;
-        return left.name.localeCompare(right.name);
-      });
+  return withDb(async (sql) => {
+    const rows = await sql<StoredUser[]>`
+      select id, email, name, role, password_hash, created_at
+      from public.app_users
+      order by case when role = 'owner' then 0 else 1 end, name
+    `;
+    return rows.map(toManaged);
   });
 }
 
 export function createUser(input: { name: string; email: string; password: string }) {
-  return withLock(async () => {
+  return withDb(async (sql) => {
     const name = input.name.trim();
     const email = normalizeEmail(input.email);
     if (!name) throw new AuthError("Enter a name.", 400);
@@ -173,29 +250,29 @@ export function createUser(input: { name: string; email: string; password: strin
     const tooShort = passwordError(input.password);
     if (tooShort) throw new AuthError(tooShort, 400);
 
-    const data = await load();
-    if (data.users.some((user) => user.email === email)) {
-      throw new AuthError("Someone with that email already has a sign-in.", 409);
+    try {
+      const rows = await sql<StoredUser[]>`
+        insert into public.app_users (id, email, name, role, password_hash)
+        values (${randomUUID()}::uuid, ${email}, ${name}, 'member', ${hashPassword(input.password)})
+        returning id, email, name, role, password_hash, created_at
+      `;
+      return toManaged(rows[0]);
+    } catch (error) {
+      if (isUniqueViolation(error)) throw new AuthError("Someone with that email already has a sign-in.", 409);
+      throw error;
     }
-
-    const user: StoredUser = {
-      id: randomUUID(),
-      email,
-      name,
-      role: "member",
-      passwordHash: hashPassword(input.password),
-      createdAt: new Date().toISOString(),
-    };
-    data.users.push(user);
-    await persist(data);
-    return toManaged(user);
   });
 }
 
 export function updateUser(userId: string, input: { name?: string; password?: string }, keepSessionId?: string) {
-  return withLock(async () => {
-    const data = await load();
-    const user = data.users.find((item) => item.id === userId);
+  return withDb(async (sql) => {
+    const rows = await sql<StoredUser[]>`
+      select id, email, name, role, password_hash, created_at
+      from public.app_users
+      where id = ${userId}::uuid
+      limit 1
+    `;
+    const user = rows[0];
     if (!user) throw new AuthError("That person was not found.", 404);
 
     if (typeof input.name === "string") {
@@ -208,23 +285,35 @@ export function updateUser(userId: string, input: { name?: string; password?: st
     if (typeof input.password === "string") {
       const tooShort = passwordError(input.password);
       if (tooShort) throw new AuthError(tooShort, 400);
-      user.passwordHash = hashPassword(input.password);
-      data.sessions = data.sessions.filter((session) => session.userId !== user.id || session.id === keepSessionId);
+      user.password_hash = hashPassword(input.password);
+      await sql`
+        delete from public.app_sessions
+        where user_id = ${userId}::uuid
+          and (${keepSessionId ?? null}::uuid is null or id <> ${keepSessionId ?? null}::uuid)
+      `;
     }
 
-    await persist(data);
-    return toManaged(user);
+    const saved = await sql<StoredUser[]>`
+      update public.app_users
+      set name = ${user.name}, password_hash = ${user.password_hash}
+      where id = ${userId}::uuid
+      returning id, email, name, role, password_hash, created_at
+    `;
+    return toManaged(saved[0]);
   });
 }
 
 export function deleteUser(userId: string) {
-  return withLock(async () => {
-    const data = await load();
-    const user = data.users.find((item) => item.id === userId);
+  return withDb(async (sql) => {
+    const rows = await sql<StoredUser[]>`
+      select id, email, name, role, password_hash, created_at
+      from public.app_users
+      where id = ${userId}::uuid
+      limit 1
+    `;
+    const user = rows[0];
     if (!user) throw new AuthError("That person was not found.", 404);
     if (user.role === "owner") throw new AuthError("Your account stays on the planner.", 400);
-    data.users = data.users.filter((item) => item.id !== userId);
-    data.sessions = data.sessions.filter((session) => session.userId !== userId);
-    await persist(data);
+    await sql`delete from public.app_users where id = ${userId}::uuid`;
   });
 }

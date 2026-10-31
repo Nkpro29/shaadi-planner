@@ -36,3 +36,30 @@ create policy "shaadisaathi anon update"
   to anon, authenticated
   using (true)
   with check (true);
+
+-- Sign-in accounts and sessions. The app creates these on first login too.
+-- Row level security stays on and the anon key has no access, so password
+-- hashes are only reachable through DATABASE_URL on the server.
+
+create table if not exists public.app_users (
+  id uuid primary key,
+  email text not null unique,
+  name text not null,
+  role text not null check (role in ('owner', 'member')),
+  password_hash text not null,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists public.app_sessions (
+  id uuid primary key,
+  user_id uuid not null references public.app_users (id) on delete cascade,
+  expires_at timestamptz not null
+);
+
+create index if not exists app_sessions_user_id_idx on public.app_sessions (user_id);
+
+alter table public.app_users enable row level security;
+alter table public.app_sessions enable row level security;
+
+revoke all on table public.app_users from anon, authenticated;
+revoke all on table public.app_sessions from anon, authenticated;

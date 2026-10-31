@@ -1,3 +1,4 @@
+import { cache } from "react";
 import { cookies } from "next/headers";
 import { SESSION_COOKIE, sessionExpiry, type PublicUser } from "./constants";
 import { AuthError, createSession, revokeSession, userForSession } from "./store";
@@ -11,13 +12,13 @@ export async function readClaims(): Promise<SessionClaims | null> {
   return verifySessionToken(token, secret);
 }
 
-export async function getCurrentUser(): Promise<PublicUser | null> {
+export const getCurrentUser = cache(async (): Promise<PublicUser | null> => {
   const claims = await readClaims();
   if (!claims) return null;
   const user = await userForSession(claims.sid, claims.uid);
   if (!user) return null;
   return { id: user.id, email: user.email, name: user.name, role: user.role };
-}
+});
 
 export async function requireOwner() {
   const user = await getCurrentUser();
